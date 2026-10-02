@@ -31,6 +31,8 @@ type DemandLine = {
   unit: string; stock: number; default_supplier_code: string | null;
   qty_order: number; qty_delivered: number; qty_ordered: number; qty_needed: number;
 };
+/* Ringkasan Sales Order untuk menjelaskan daftar kebutuhan yang kosong. */
+type SoRingkas = { no: string; status: string; delivery_date: string | null };
 type SupOption = {
   product_id: string; supplier_code: string; supplier_name: string; supplier_type: string;
   price: number; price_source: string; price_date: string | null;
@@ -100,13 +102,19 @@ function PoPage() {
 
   /* ---------- KEBUTUHAN PEMBELIAN ---------- */
   const [demLines, setDemLines] = useState<DemandLine[]>([]);
+  const [soAll, setSoAll] = useState<SoRingkas[]>([]);
   const [demOpts, setDemOpts] = useState<Map<string, SupOption[]>>(new Map());
   const [demLoaded, setDemLoaded] = useState(false);
   const [demErr, setDemErr] = useState<string | null>(null);
   const [dFrom, setDFrom] = useState(todayJkt());
   const [dTo, setDTo] = useState(dAdd(todayJkt(), 6));
   const [dCat, setDCat] = useState('ALL');
-  const [dOnly, setDOnly] = useState<'BELI' | 'ALL'>('BELI');
+  /* Bawaannya "Semua kebutuhan": begitu sebuah Sales Order disetujui, ia harus
+     langsung terlihat di sini — entah stok sudah menutupinya atau belum. Dengan
+     bawaan "Hanya yang perlu dibeli", order yang stoknya mencukupi menghilang
+     dari daftar dan halaman tampak kosong tanpa sebab yang jelas. Pembeli yang
+     ingin menyaring tinggal memilihnya sendiri. */
+  const [dOnly, setDOnly] = useState<'BELI' | 'ALL'>('ALL');
   const [dQ, setDQ] = useState('');
   const [sel, setSel] = useState<Record<string, boolean>>({});
   const [qtySel, setQtySel] = useState<Record<string, number>>({});
@@ -135,10 +143,15 @@ function PoPage() {
   const [busy, setBusy] = useState(false);
 
   const loadDemand = useCallback(async () => {
-    const [ld, lo] = await Promise.all([
+    const [ld, lo, lso] = await Promise.all([
       supabase.from('purchase_demand_line_view').select('*'),
       supabase.rpc('demand_supplier_options', { p_date: todayJkt() }),
+      /* Status Sales Order di luar saringan. Dipakai hanya bila daftar
+         kebutuhan kosong, untuk menyebut sebabnya alih-alih membiarkan
+         halaman tampak rusak tanpa penjelasan. */
+      supabase.from('sales_order').select('no, status, delivery_date'),
     ]);
+    setSoAll(((lso.data as SoRingkas[]) || []));
     /* Galat dari Supabase ditampilkan, bukan ditelan — tanpa ini, basis data
        tanpa purchase_demand_line_view menghasilkan tab Kebutuhan Pembelian
        yang kosong dan tampak wajar. */
@@ -213,8 +226,12 @@ function PoPage() {
   /* Tab awal ditentukan setelah data kebutuhan selesai dimuat. Kalau
      diputuskan lebih awal, nPerlu masih nol dan tab selalu jatuh ke Daftar PO
      meski ada barang yang menunggu dipesan. */
-  useEffect(() => { if (tab === null && demLoaded) setTab(nPerlu ? 'need' : 'list'); },
-    [tab, nPerlu, demLoaded]);
+  /* Tab dibuka pada Kebutuhan Pembelian selama ada kebutuhan pada rentang ini —
+     bukan hanya ketika ada yang perlu dibeli. Sebelumnya, order yang stoknya
+     sudah mencukupi membuat halaman meloncat ke Daftar PO, sehingga order yang
+     baru disetujui seolah tidak pernah sampai. */
+  useEffect(() => { if (tab === null && demLoaded) setTab(inRange.length ? 'need' : 'list'); },
+    [tab, inRange.length, demLoaded]);
 
   const supOf = (g: Grp) => (supSel[g.pid] && g.sups.some((x) => x.supplier_code === supSel[g.pid])
     ? supSel[g.pid] : (g.sups.length ? g.sups[0].supplier_code : ''));
@@ -253,6 +270,9 @@ function PoPage() {
   const supKeys = [...bySup.keys()].sort((a, b) => s.supp(a).name.localeCompare(s.supp(b).name));
   const selTotal = selGroups.reduce((a, g) => a + Math.round(qtyOfG(g) * priceOfG(g)), 0);
   const selQty = selGroups.reduce((a, g) => a + qtyOfG(g), 0);
+  /* Dicentang tapi tidak masuk hitungan — dua sebabnya dibedakan supaya pesannya tepat. */
+  const qtyNolTerpilih = allGroups.filter((g) => sel[g.pid] && g.sups.length && qtyOfG(g) <= 0).length;
+  const tanpaSupTerpilih = allGroups.filter((g) => sel[g.pid] && !g.sups.length).length;
 
   const tKeb = groups.reduce((a, g) => a + g.qty, 0);
   const tBeli = groups.reduce((a, g) => a + g.beli, 0);
@@ -261,6 +281,61 @@ function PoPage() {
   const tanpaSup = groups.filter((g) => !g.sups.length).length;
   const nSOdem = new Set(demFiltered.map((r) => r.order_no)).size;
   const nCustDem = new Set(demFiltered.map((r) => r.customer_code)).size;
+
+  /* ---------- MENGAPA DAFTARNYA KOSONG ----------
+
+     Daftar kebutuhan melewati empat saringan berlapis, dan sebelumnya
+     kekosongan di ujungnya tampak sama saja apa pun sebabnya: Sales Order
+     yang belum disetujui, tanggal kirim di luar rentang, saringan kategori,
+     atau stok yang sudah menutup seluruh kebutuhan. Blok ini menyebut
+     saringan mana yang menggugurkan barisnya, dan menyediakan tombol untuk
+     membatalkannya. */
+  const tglKirim = demLines.map((r) => r.delivery_date).filter(Boolean).sort();
+  const menungguApproval = soAll.filter((o) => o.status === 'DRAFT' || o.status === 'SUBMITTED').length;
+  const sebabKosong: { judul: string; isi: React.ReactNode } | null = (() => {
+    if (demErr || groups.length) return null;
+
+    if (!demLines.length) {
+      if (menungguApproval) {
+        return { judul: `${num(menungguApproval, 0)} Sales Order menunggu persetujuan`,
+          isi: (<>Daftar kebutuhan hanya menghitung order yang sudah <b>APPROVED</b>. Setujui
+            lebih dulu di menu <b>Order Approval</b>, lalu kembali ke halaman ini.</>) };
+      }
+      if (!soAll.length) {
+        return { judul: 'Belum ada Sales Order',
+          isi: <>Buat Sales Order lebih dulu di menu <b>Sales Order</b>, lalu setujui di <b>Order Approval</b>.</> };
+      }
+      return { judul: 'Tidak ada kebutuhan yang tersisa',
+        isi: (<>Seluruh Sales Order yang disetujui sudah terkirim penuh atau barangnya
+          sudah dipesan ke supplier. Tidak ada yang perlu dibeli saat ini.</>) };
+    }
+
+    if (!inRange.length) {
+      return { judul: 'Semua kebutuhan ada di luar rentang tanggal kirim',
+        isi: (<>Ada <b>{num(demLines.length, 0)} baris kebutuhan</b>, tetapi tanggal kirimnya
+          antara <b>{dFmt(tglKirim[0])}</b> dan <b>{dFmt(tglKirim[tglKirim.length - 1])}</b> —
+          di luar rentang {dFmt(dFrom)} s/d {dFmt(dTo)} yang sedang dipakai.{' '}
+          <button className="btn sm" style={{ marginLeft: 6 }}
+            onClick={() => { setDFrom(tglKirim[0]); setDTo(tglKirim[tglKirim.length - 1]); }}>
+            Lebarkan ke seluruh tanggal
+          </button></>) };
+    }
+
+    if (!demFiltered.length) {
+      return { judul: 'Saringan kategori atau pencarian menggugurkan semuanya',
+        isi: (<>Ada <b>{num(inRange.length, 0)} baris</b> pada rentang tanggal ini.{' '}
+          <button className="btn sm" onClick={() => { setDCat('ALL'); setDQ(''); }}>
+            Hapus saringan
+          </button></>) };
+    }
+
+    return { judul: 'Stok menutup seluruh kebutuhan',
+      isi: (<><b>{num(allGroups.length, 0)} produk</b> dibutuhkan pada rentang ini, tetapi
+        stoknya mencukupi sehingga tidak ada yang perlu dibeli.{' '}
+        <button className="btn sm" onClick={() => setDOnly('ALL')}>
+          Tampilkan semua kebutuhan
+        </button></>) };
+  })();
 
   function openCreate() {
     if (!selGroups.length) { s.toast('Belum ada produk yang dipilih untuk dipesan.', 'err'); return; }
@@ -412,6 +487,12 @@ function PoPage() {
             sb={tanpaSup ? `${tanpaSup} produk tanpa supplier` : 'harga supplier terpilih'} />
         </KpiGrid>
 
+        {sebabKosong ? (
+          <div className="info-box mt14">
+            <b>{sebabKosong.judul}.</b><br />{sebabKosong.isi}
+          </div>
+        ) : null}
+
         <Card><CardBody flush>
           <DataTable<Grp> rows={groups} rowKey={(g) => g.pid} onRow={setDemDetail}
             emptyT={dOnly === 'BELI' ? 'Tidak ada produk yang perlu dibeli pada rentang ini'
@@ -481,18 +562,36 @@ function PoPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
               <div className="sm" style={{ flex: 1, minWidth: 240 }}>
                 {!selGroups.length ? (
+                  /* Baris yang dicentang tetapi Qty Pesan-nya nol tidak ikut terhitung.
+                     Tanpa penjelasan ini, kotak centang tampak aktif sementara aplikasi
+                     berkata belum ada yang dipilih — dan tombol Terbitkan menolak. */
+                  qtyNolTerpilih ? (
+                    <span className="mut"><b>{num(qtyNolTerpilih, 0)} produk dicentang, tetapi
+                      Qty Pesan-nya masih 0</b> — stok sudah menutup seluruh kebutuhannya.
+                      Isi kolom <b>Qty Pesan</b> bila tetap ingin memesan ke supplier.</span>
+                  ) : tanpaSupTerpilih ? (
+                    <span className="mut"><b>{num(tanpaSupTerpilih, 0)} produk dicentang</b> tetapi
+                      belum punya supplier. Tambahkan supplier produk itu di Master Supplier.</span>
+                  ) : (
                   <span className="mut">Belum ada produk dipilih. Centang baris yang akan dipesan,
-                    atau tekan “Pilih semua yang perlu dibeli”.</span>
+                    atau tekan “Pilih semua yang perlu dibeli”.</span>)
                 ) : (<>
                   Terpilih <b>{num(selGroups.length, 0)} produk</b> · {num(selQty, 0)} unit ·{' '}
                   <b>{num(supKeys.length, 0)} Purchase Order</b> ke{' '}
                   {supKeys.map((c) => s.supp(c).name).join(', ')} · nilai <b>{rp(selTotal)}</b>
                 </>)}
               </div>
-              <button className="btn" onClick={() => setSel(() => {
+              <button className="btn" onClick={() => {
                 const y: Record<string, boolean> = {};
                 allGroups.forEach((g) => { if (g.beli > 0 && g.sups.length) y[g.pid] = true; });
-                return y; })}>Pilih semua yang perlu dibeli</button>
+                /* Tanpa pesan ini tombolnya tampak mati: ia memang tidak memilih apa pun
+                   ketika stok sudah menutup seluruh kebutuhan. */
+                if (!Object.keys(y).length) {
+                  s.toast('Tidak ada produk dengan Perlu Beli di atas 0 pada rentang ini — '
+                    + 'stok sudah mencukupi. Isi Qty Pesan manual bila tetap ingin memesan.', 'warn');
+                }
+                setSel(y);
+              }}>Pilih semua yang perlu dibeli</button>
               <button className="btn" onClick={() => setSel({})}>Kosongkan pilihan</button>
               {s.can('create') ? (
                 <button className="btn pri" onClick={openCreate}>Terbitkan Purchase Order</button>) : null}
